@@ -19,7 +19,7 @@
             text-align: center;
         }
         main {
-            max-width: 960px;
+            max-width: 720px;
             margin: 2rem auto;
             background: #fff;
             padding: 2rem;
@@ -39,21 +39,10 @@
             font-weight: 600;
         }
         input[type="file"] {
-            padding: 0.5rem;
+            padding: 0.75rem;
             border: 1px solid #ccc;
             border-radius: 8px;
             background: #fafafa;
-        }
-        .checkboxes {
-            display: flex;
-            flex-wrap: wrap;
-            gap: 1.5rem;
-        }
-        .checkboxes label {
-            font-weight: 400;
-            display: flex;
-            align-items: center;
-            gap: 0.5rem;
         }
         button[type="submit"] {
             background: #1a73e8;
@@ -64,6 +53,7 @@
             border-radius: 999px;
             cursor: pointer;
             transition: background 0.2s ease;
+            width: fit-content;
         }
         button[type="submit"]:hover {
             background: #155fc0;
@@ -82,33 +72,22 @@
             background: #fce8e6;
             color: #d93025;
         }
-        .status {
-            font-size: 0.9rem;
-            color: #555;
-        }
-        table {
-            width: 100%;
-            border-collapse: collapse;
-            margin-top: 1.5rem;
-        }
-        th, td {
-            padding: 0.75rem;
-            border-bottom: 1px solid #eee;
-            text-align: right;
-        }
-        th {
-            background: #f1f3f4;
-        }
-        .downloads {
-            margin-top: 1.5rem;
-            display: flex;
-            flex-direction: column;
+        .summary {
+            margin-top: 2rem;
+            padding: 1.5rem;
+            border: 1px solid #e0e0e0;
+            border-radius: 12px;
+            background: #fafafa;
+            display: grid;
             gap: 0.75rem;
         }
-        .downloads a {
+        .summary strong {
+            font-weight: 700;
+        }
+        .download-link {
             color: #1a73e8;
-            text-decoration: none;
             font-weight: 600;
+            text-decoration: none;
         }
         @media (max-width: 600px) {
             main {
@@ -121,7 +100,7 @@
 <body>
     <header>
         <h1>מנתח לחצנים חכמים</h1>
-        <p class="status">מצב Docupipe: {{ 'מוגדר' if docupipe_ready else 'לא מוגדר - העלו JSON או הגדירו מפתח' }}</p>
+        <p>העלו קובץ PDF אחד וחילצו את תוויות הלחצנים לקובץ אקסל.</p>
     </header>
     <main>
         {% with messages = get_flashed_messages(with_categories=true) %}
@@ -133,51 +112,18 @@
         {% endwith %}
         <form action="{{ url_for('process') }}" method="post" enctype="multipart/form-data">
             <div class="field">
-                <label for="json_file">קובץ JSON (מועדף אם קיים)</label>
-                <input id="json_file" name="json_file" type="file" accept="application/json">
-            </div>
-            <div class="field">
-                <label for="pdf_file">קובץ PDF (יעובד דרך Docupipe)</label>
-                <input id="pdf_file" name="pdf_file" type="file" accept="application/pdf">
-            </div>
-            <div class="checkboxes">
-                <label>
-                    <input type="checkbox" name="include_options" checked>
-                    לכלול אפשרויות עם selected=true
-                </label>
-                <label>
-                    <input type="checkbox" name="include_raw" checked>
-                    לייצא ספירות גולמיות (QA)
-                </label>
+                <label for="pdf_file">קובץ PDF</label>
+                <input id="pdf_file" name="pdf_file" type="file" accept="application/pdf" required>
             </div>
             <button type="submit">הפעל</button>
         </form>
 
         {% if results %}
-            <section class="downloads">
-                <h2>קבצי פלט</h2>
-                {% for file in results.files %}
-                    <a href="{{ url_for('download_file', filename=file.name) }}" download>{{ file.label }}</a>
-                {% endfor %}
-            </section>
-            <section>
-                <h2>20 הערכים המובילים</h2>
-                <table>
-                    <thead>
-                        <tr>
-                            <th>ערך</th>
-                            <th>מופעים</th>
-                        </tr>
-                    </thead>
-                    <tbody>
-                        {% for item in results.top_20 %}
-                            <tr>
-                                <td>{{ item.label }}</td>
-                                <td>{{ item.count }}</td>
-                            </tr>
-                        {% endfor %}
-                    </tbody>
-                </table>
+            <section class="summary">
+                <p><strong>שיטת חילוץ:</strong> {{ results.extraction_mode }}</p>
+                <p><strong>תוויות שנמצאו:</strong> {{ results.total_labels }}</p>
+                <p><strong>שורות שנכתבו לאקסל:</strong> {{ results.total_rows }}</p>
+                <a class="download-link" href="{{ url_for('download_file', filename=results.file.name) }}" download>{{ results.file.label }}</a>
             </section>
         {% endif %}
     </main>
