@@ -35,8 +35,9 @@ else:
     auto_tesseract = which("tesseract")
     if auto_tesseract:
         pytesseract.pytesseract.tesseract_cmd = auto_tesseract
-    elif Path(DEFAULT_TESS).exists():
-        pytesseract.pytesseract.tesseract_cmd = DEFAULT_TESS
+
+if not TESSERACT_CMD and Path(DEFAULT_TESS).exists():
+    pytesseract.pytesseract.tesseract_cmd = DEFAULT_TESS
 
 POPPLER_PATH = os.getenv("POPPLER_PATH")
 if not POPPLER_PATH:
@@ -91,7 +92,7 @@ def extract_text_with_pymupdf(pdf_bytes: bytes) -> str:
 
 
 def _preprocess_image_for_ocr(pil_img) -> np.ndarray:
-    """Light preprocessing: grayscale + OTSU binarization."""
+    """Grayscale + OTSU binarization to improve OCR on short labels."""
     im = np.array(pil_img.convert("L"))
     im = cv2.threshold(im, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1]
     return im
@@ -99,29 +100,28 @@ def _preprocess_image_for_ocr(pil_img) -> np.ndarray:
 
 def ocr_pdf(pdf_bytes: bytes) -> str:
     try:
+        # Increase to dpi=400 if OCR is still weak
         images = convert_from_bytes(pdf_bytes, dpi=300, poppler_path=POPPLER_PATH)
-    except Exception as exc:  # pylint: disable=broad-except
-        raise RuntimeError("כשל בהמרת PDF לתמונות. ודאו ש-Poppler מותקן.") from exc
+    except Exception as exc:
+        raise RuntimeError("PDF → image conversion failed. Make sure Poppler is installed.") from exc
 
-    # Tesseract config tuned for Hebrew UI text
-    ts_config = r"--oem 1 --psm 6 -l heb+eng"
+    # psm 9 improves recognition of short separated words (better for labeling)
+    ts_config = r'--oem 1 --psm 9 -l heb+eng'
+
     words: List[str] = []
     for index, image in enumerate(images):
         try:
             im = _preprocess_image_for_ocr(image)
-            data = pytesseract.image_to_data(
-                im, config=ts_config, output_type=pytesseract.Output.DICT
-            )
+            data = pytesseract.image_to_data(im, config=ts_config, output_type=pytesseract.Output.DICT)
             for txt in data.get("text", []):
                 txt = (txt or "").strip()
                 if txt:
                     words.append(txt)
         except pytesseract.TesseractError as exc:
-            raise RuntimeError("כשל בהרצת Tesseract OCR. ודאו ש-Tesseract מותקן עם heb+eng.") from exc
-        except Exception as exc:  # pylint: disable=broad-except
-            raise RuntimeError(f"כשל ב-OCR בעמוד {index + 1}.") from exc
+            raise RuntimeError("Tesseract OCR failed. Make sure Hebrew language pack is installed.") from exc
+        except Exception as exc:
+            raise RuntimeError(f"OCR failed on page {index + 1}.") from exc
 
-    # Join by words (more stable than raw line join)
     return " ".join(words)
 
 
@@ -144,7 +144,7 @@ def extract_pdf_content(pdf_bytes: bytes) -> Tuple[str, str]:
     raise RuntimeError("לא נמצאו נתונים ניתנים לקריאה ב-PDF שסופק.")
 
 
-LABEL_QUOTE_RE = re.compile(r"“([^”]+)”|\"([^"]+)\"|׳([^׳]+)׳|'([^']+)'")
+LABEL_QUOTE_RE = re.compile(r"""“([^”]+)”|"([^"]+)"|׳([^׳]+)׳|'([^']+)'""")
 ANCHORS = [
     r"ENGRAVING",
     r"BUTTON",
@@ -159,73 +159,51 @@ ANCHOR_RE = re.compile(rf"({'|'.join(ANCHORS)})[:\s]*", re.IGNORECASE)
 
 
 def parse_labels_from_text(text: str) -> List[str]:
-    labels: List[str] = []
-
-    # A) Prefer quoted labels first
-    for t in LABEL_QUOTE_RE.findall(text):
-        lbl = next((x for x in t if x), "")
-        if lbl:
-            labels.append(lbl.strip())
-
-    if labels:
-        # Dedup obvious repeats
-        seen = set()
-        out = []
-        for x in labels:
-            k = re.sub(r"\s+", " ", x.strip())
-            if k and k not in seen:
-                seen.add(k)
-                out.append(k)
-        return out
-
-    # B) Fallback: section-based heuristics using anchors
+    """
+    Extracts short Hebrew labels from OCR/text extraction:
+    - Drops English/metadata lines (Name/Description/etc.)
+    - Extracts only short Hebrew segments (1–30 chars)
+    - Cleans duplicates and noise
+    """
     lines = [sanitize_line(ln) for ln in text.splitlines()]
     lines = [ln for ln in lines if ln]
-    take = False
-    buf: List[str] = []
 
-    def flush():
-        nonlocal buf, labels
-        if not buf:
-            return
-        seen = set()
-        for item in buf:
-            cleaned = re.sub(r"\s+", " ", item).strip()
-            if cleaned and cleaned not in seen:
-                seen.add(cleaned)
-                labels.append(cleaned)
-        buf = []
+    labels: List[str] = []
+
+    # Drop noisy English/metadata lines
+    DROP_RE = re.compile(
+        r'(?:\bName\b|\bDescription\b|\bOrder information\b|\bWhite\b|\bHZ2\b|\bKPCN\b|\d{2,}|\bLEFT\b|\bRIGHT\b|\bENTRY\b)',
+        re.IGNORECASE
+    )
+    LATIN_RE = re.compile(r'[A-Za-z]')
+
+    # Hebrew short segments extractor
+    HEB_SEG_RE = re.compile(r'[\u0590-\u05FF][\u0590-\u05FF\s\.\-]{0,29}')
 
     for ln in lines:
-        if ANCHOR_RE.search(ln):
-            flush()
-            take = True
+        if DROP_RE.search(ln) or (LATIN_RE.search(ln) and not HEBREW_LETTER_PATTERN.search(ln)):
             continue
-        if take:
-            # stop on a new generic section header
-            if re.search(r"^\s*(ROOM|SWITCH|SECTION|LOADS|END|SUMMARY)\b", ln, re.IGNORECASE):
-                flush()
-                take = False
+
+        for m in HEB_SEG_RE.finditer(ln):
+            seg = sanitize_line(m.group(0))
+            if not seg:
                 continue
-            # collect short Hebrew-ish phrases; split common delimiters
-            if HEBREW_LETTER_PATTERN.search(ln) and len(ln) <= 40:
-                parts = re.split(r"[,\t|·•/\\]+", ln)
-                for p in parts:
-                    p = p.strip()
-                    if p and (2 <= len(p) <= 30):
-                        buf.append(p)
+            if not HEBREW_LETTER_PATTERN.search(seg):
+                continue
+            if 1 <= len(seg) <= 30:
+                labels.append(seg)
 
-    flush()
-
-    # Final dedup
-    out: List[str] = []
-    seen2 = set()
+    cleaned: List[str] = []
+    seen = set()
     for x in labels:
-        k = re.sub(r"\s+", " ", x)
-        if k and k not in seen2:
-            seen2.add(k)
-            out.append(k)
-    return out
+        k = re.sub(r'\s+', ' ', x).strip()
+        if not k or len(k) == 1:
+            continue
+        if k not in seen:
+            seen.add(k)
+            cleaned.append(k)
+
+    return cleaned
 
 
 def normalize_label(label: str) -> str:
