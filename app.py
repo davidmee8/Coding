@@ -6,8 +6,11 @@ from collections import Counter
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, Iterable, List, Tuple, Optional
+from shutil import which
 
+import cv2
 import fitz  # PyMuPDF
+import numpy as np
 import pandas as pd
 import pytesseract
 from dotenv import load_dotenv
@@ -22,9 +25,26 @@ OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 load_dotenv()
 
+DEFAULT_TESS = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+DEFAULT_POPPLER = r"C:\poppler\Library\bin"
+
 TESSERACT_CMD = os.getenv("TESSERACT_CMD")
 if TESSERACT_CMD:
     pytesseract.pytesseract.tesseract_cmd = TESSERACT_CMD
+else:
+    auto_tesseract = which("tesseract")
+    if auto_tesseract:
+        pytesseract.pytesseract.tesseract_cmd = auto_tesseract
+    elif Path(DEFAULT_TESS).exists():
+        pytesseract.pytesseract.tesseract_cmd = DEFAULT_TESS
+
+POPPLER_PATH = os.getenv("POPPLER_PATH")
+if not POPPLER_PATH:
+    detected_poppler = which("pdftoppm")
+    if detected_poppler:
+        POPPLER_PATH = str(Path(detected_poppler).parent)
+if not POPPLER_PATH and Path(DEFAULT_POPPLER).exists():
+    POPPLER_PATH = DEFAULT_POPPLER
 
 HEBREW_LETTER_PATTERN = re.compile(r"[\u0590-\u05FF]")
 DIRECTIONAL_MARKS_PATTERN = re.compile(r"[\u200e\u200f]")
@@ -52,11 +72,13 @@ def sanitize_line(line: str) -> str:
 def has_meaningful_text(text: str) -> bool:
     if not text:
         return False
-    hebrew_letters = HEBREW_LETTER_PATTERN.findall(text)
-    if len(hebrew_letters) >= 10:
+    # Count Hebrew/Latin letters
+    letters = re.findall(r"[\u0590-\u05FFA-Za-z]", text)
+    if len(letters) >= 200:
         return True
-    words = [word for word in re.split(r"\s+", text) if HEBREW_LETTER_PATTERN.search(word)]
-    return len(words) >= 5
+    # Or at least several Hebrew words
+    words = [w for w in re.split(r"\s+", text) if HEBREW_LETTER_PATTERN.search(w)]
+    return len(words) >= 15
 
 
 def extract_text_with_pymupdf(pdf_bytes: bytes) -> str:
@@ -68,24 +90,39 @@ def extract_text_with_pymupdf(pdf_bytes: bytes) -> str:
         raise RuntimeError("כשל בקריאת ה-PDF (חילוץ טקסט).") from exc
 
 
+def _preprocess_image_for_ocr(pil_img) -> np.ndarray:
+    """Light preprocessing: grayscale + OTSU binarization."""
+    im = np.array(pil_img.convert("L"))
+    im = cv2.threshold(im, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1]
+    return im
+
+
 def ocr_pdf(pdf_bytes: bytes) -> str:
-    poppler_path = os.getenv("POPPLER_PATH") or None
     try:
-        images = convert_from_bytes(pdf_bytes, dpi=300, poppler_path=poppler_path)
+        images = convert_from_bytes(pdf_bytes, dpi=300, poppler_path=POPPLER_PATH)
     except Exception as exc:  # pylint: disable=broad-except
         raise RuntimeError("כשל בהמרת PDF לתמונות. ודאו ש-Poppler מותקן.") from exc
 
-    texts: List[str] = []
+    # Tesseract config tuned for Hebrew UI text
+    ts_config = r"--oem 1 --psm 6 -l heb+eng"
+    words: List[str] = []
     for index, image in enumerate(images):
         try:
-            texts.append(pytesseract.image_to_string(image, lang="heb+eng"))
+            im = _preprocess_image_for_ocr(image)
+            data = pytesseract.image_to_data(
+                im, config=ts_config, output_type=pytesseract.Output.DICT
+            )
+            for txt in data.get("text", []):
+                txt = (txt or "").strip()
+                if txt:
+                    words.append(txt)
         except pytesseract.TesseractError as exc:
-            raise RuntimeError(
-                "כשל בהרצת Tesseract OCR. ודאו ש-Tesseract מותקן עם חבילות השפה heb+eng."
-            ) from exc
+            raise RuntimeError("כשל בהרצת Tesseract OCR. ודאו ש-Tesseract מותקן עם heb+eng.") from exc
         except Exception as exc:  # pylint: disable=broad-except
             raise RuntimeError(f"כשל ב-OCR בעמוד {index + 1}.") from exc
-    return "\n".join(texts)
+
+    # Join by words (more stable than raw line join)
+    return " ".join(words)
 
 
 def extract_pdf_content(pdf_bytes: bytes) -> Tuple[str, str]:
@@ -107,47 +144,88 @@ def extract_pdf_content(pdf_bytes: bytes) -> Tuple[str, str]:
     raise RuntimeError("לא נמצאו נתונים ניתנים לקריאה ב-PDF שסופק.")
 
 
-def _flush_block(block: List[str], labels: List[str]) -> None:
-    if not block:
-        return
-    seen = set()
-    for item in block:
-        cleaned = re.sub(r"\s+", " ", item).strip()
-        if not cleaned or cleaned in seen:
-            continue
-        seen.add(cleaned)
-        labels.append(cleaned)
-    block.clear()
+LABEL_QUOTE_RE = re.compile(r"“([^”]+)”|\"([^"]+)\"|׳([^׳]+)׳|'([^']+)'")
+ANCHORS = [
+    r"ENGRAVING",
+    r"BUTTON",
+    r"LABEL",
+    r"LIGHTING\s+LOADS",
+    r"SHADE\s+LOADS",
+    r"אנגרייב",
+    r"חריטה",
+    r"תוויות",
+]
+ANCHOR_RE = re.compile(rf"({'|'.join(ANCHORS)})[:\s]*", re.IGNORECASE)
 
 
 def parse_labels_from_text(text: str) -> List[str]:
     labels: List[str] = []
-    current_block: List[str] = []
 
-    for raw_line in text.splitlines():
-        sanitized = sanitize_line(raw_line)
-        if not sanitized:
-            _flush_block(current_block, labels)
+    # A) Prefer quoted labels first
+    for t in LABEL_QUOTE_RE.findall(text):
+        lbl = next((x for x in t if x), "")
+        if lbl:
+            labels.append(lbl.strip())
+
+    if labels:
+        # Dedup obvious repeats
+        seen = set()
+        out = []
+        for x in labels:
+            k = re.sub(r"\s+", " ", x.strip())
+            if k and k not in seen:
+                seen.add(k)
+                out.append(k)
+        return out
+
+    # B) Fallback: section-based heuristics using anchors
+    lines = [sanitize_line(ln) for ln in text.splitlines()]
+    lines = [ln for ln in lines if ln]
+    take = False
+    buf: List[str] = []
+
+    def flush():
+        nonlocal buf, labels
+        if not buf:
+            return
+        seen = set()
+        for item in buf:
+            cleaned = re.sub(r"\s+", " ", item).strip()
+            if cleaned and cleaned not in seen:
+                seen.add(cleaned)
+                labels.append(cleaned)
+        buf = []
+
+    for ln in lines:
+        if ANCHOR_RE.search(ln):
+            flush()
+            take = True
             continue
-
-        if ":" in sanitized:
-            potential = sanitized.split(":", 1)[1].strip()
-            if potential and HEBREW_LETTER_PATTERN.search(potential):
-                sanitized = potential
-            else:
+        if take:
+            # stop on a new generic section header
+            if re.search(r"^\s*(ROOM|SWITCH|SECTION|LOADS|END|SUMMARY)\b", ln, re.IGNORECASE):
+                flush()
+                take = False
                 continue
+            # collect short Hebrew-ish phrases; split common delimiters
+            if HEBREW_LETTER_PATTERN.search(ln) and len(ln) <= 40:
+                parts = re.split(r"[,\t|·•/\\]+", ln)
+                for p in parts:
+                    p = p.strip()
+                    if p and (2 <= len(p) <= 30):
+                        buf.append(p)
 
-        parts = [part.strip() for part in re.split(r"[\\/\|]+", sanitized) if part.strip()]
-        if not parts:
-            continue
+    flush()
 
-        for part in parts:
-            if not HEBREW_LETTER_PATTERN.search(part):
-                continue
-            current_block.append(part)
-
-    _flush_block(current_block, labels)
-    return labels
+    # Final dedup
+    out: List[str] = []
+    seen2 = set()
+    for x in labels:
+        k = re.sub(r"\s+", " ", x)
+        if k and k not in seen2:
+            seen2.add(k)
+            out.append(k)
+    return out
 
 
 def normalize_label(label: str) -> str:
@@ -314,6 +392,8 @@ class LabelExtractorGUI:
 
             text, extraction_mode = extract_pdf_content(pdf_bytes)
             labels_raw = parse_labels_from_text(text)
+            # Filter out obvious OCR garbage (very long unbroken strings)
+            labels_raw = [x for x in labels_raw if len(x) <= 40]
 
             if not labels_raw:
                 raise ValueError("לא נמצאו תוויות בעמודים שנסרקו.")
