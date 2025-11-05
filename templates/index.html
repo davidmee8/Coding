@@ -1,0 +1,185 @@
+<!DOCTYPE html>
+<html lang="he" dir="rtl">
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>מנתח לחצנים חכמים</title>
+    <style>
+        body {
+            font-family: 'Rubik', 'Alef', Arial, sans-serif;
+            background: #f7f7f7;
+            margin: 0;
+            padding: 0;
+            color: #333;
+        }
+        header {
+            background: #1a73e8;
+            color: #fff;
+            padding: 1.5rem 1rem;
+            text-align: center;
+        }
+        main {
+            max-width: 960px;
+            margin: 2rem auto;
+            background: #fff;
+            padding: 2rem;
+            border-radius: 12px;
+            box-shadow: 0 4px 16px rgba(0, 0, 0, 0.08);
+        }
+        form {
+            display: grid;
+            gap: 1.5rem;
+        }
+        .field {
+            display: flex;
+            flex-direction: column;
+            gap: 0.5rem;
+        }
+        label {
+            font-weight: 600;
+        }
+        input[type="file"] {
+            padding: 0.5rem;
+            border: 1px solid #ccc;
+            border-radius: 8px;
+            background: #fafafa;
+        }
+        .checkboxes {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 1.5rem;
+        }
+        .checkboxes label {
+            font-weight: 400;
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+        }
+        button[type="submit"] {
+            background: #1a73e8;
+            color: #fff;
+            border: none;
+            padding: 0.75rem 1.5rem;
+            font-size: 1rem;
+            border-radius: 999px;
+            cursor: pointer;
+            transition: background 0.2s ease;
+        }
+        button[type="submit"]:hover {
+            background: #155fc0;
+        }
+        .alert {
+            padding: 0.75rem 1rem;
+            border-radius: 8px;
+            margin-bottom: 1rem;
+            font-weight: 500;
+        }
+        .alert.success {
+            background: #e6f4ea;
+            color: #0b8043;
+        }
+        .alert.error {
+            background: #fce8e6;
+            color: #d93025;
+        }
+        .status {
+            font-size: 0.9rem;
+            color: #555;
+        }
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            margin-top: 1.5rem;
+        }
+        th, td {
+            padding: 0.75rem;
+            border-bottom: 1px solid #eee;
+            text-align: right;
+        }
+        th {
+            background: #f1f3f4;
+        }
+        .downloads {
+            margin-top: 1.5rem;
+            display: flex;
+            flex-direction: column;
+            gap: 0.75rem;
+        }
+        .downloads a {
+            color: #1a73e8;
+            text-decoration: none;
+            font-weight: 600;
+        }
+        @media (max-width: 600px) {
+            main {
+                margin: 1rem;
+                padding: 1.5rem;
+            }
+        }
+    </style>
+</head>
+<body>
+    <header>
+        <h1>מנתח לחצנים חכמים</h1>
+        <p class="status">מצב Docupipe: {{ 'מוגדר' if docupipe_ready else 'לא מוגדר - העלו JSON או הגדירו מפתח' }}</p>
+    </header>
+    <main>
+        {% with messages = get_flashed_messages(with_categories=true) %}
+            {% if messages %}
+                {% for category, message in messages %}
+                    <div class="alert {{ category }}">{{ message }}</div>
+                {% endfor %}
+            {% endif %}
+        {% endwith %}
+        <form action="{{ url_for('process') }}" method="post" enctype="multipart/form-data">
+            <div class="field">
+                <label for="json_file">קובץ JSON (מועדף אם קיים)</label>
+                <input id="json_file" name="json_file" type="file" accept="application/json">
+            </div>
+            <div class="field">
+                <label for="pdf_file">קובץ PDF (יעובד דרך Docupipe)</label>
+                <input id="pdf_file" name="pdf_file" type="file" accept="application/pdf">
+            </div>
+            <div class="checkboxes">
+                <label>
+                    <input type="checkbox" name="include_options" checked>
+                    לכלול אפשרויות עם selected=true
+                </label>
+                <label>
+                    <input type="checkbox" name="include_raw" checked>
+                    לייצא ספירות גולמיות (QA)
+                </label>
+            </div>
+            <button type="submit">הפעל</button>
+        </form>
+
+        {% if results %}
+            <section class="downloads">
+                <h2>קבצי פלט</h2>
+                {% for file in results.files %}
+                    <a href="{{ url_for('download_file', filename=file.name) }}" download>{{ file.label }}</a>
+                {% endfor %}
+            </section>
+            <section>
+                <h2>20 הערכים המובילים</h2>
+                <table>
+                    <thead>
+                        <tr>
+                            <th>ערך</th>
+                            <th>מופעים</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {% for item in results.top_20 %}
+                            <tr>
+                                <td>{{ item.label }}</td>
+                                <td>{{ item.count }}</td>
+                            </tr>
+                        {% endfor %}
+                    </tbody>
+                </table>
+            </section>
+        {% endif %}
+    </main>
+</body>
+</html>
