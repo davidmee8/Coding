@@ -1,25 +1,19 @@
 import os
 import re
+import subprocess
+import sys
 from collections import Counter
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, Iterable, List, Tuple
+from typing import Dict, Iterable, List, Tuple, Optional
 
 import fitz  # PyMuPDF
 import pandas as pd
 import pytesseract
 from dotenv import load_dotenv
-from flask import (
-    Flask,
-    flash,
-    redirect,
-    render_template,
-    request,
-    send_from_directory,
-    session,
-    url_for,
-)
 from pdf2image import convert_from_bytes
+from tkinter import filedialog, messagebox, ttk
+import tkinter as tk
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -31,9 +25,6 @@ load_dotenv()
 TESSERACT_CMD = os.getenv("TESSERACT_CMD")
 if TESSERACT_CMD:
     pytesseract.pytesseract.tesseract_cmd = TESSERACT_CMD
-
-app = Flask(__name__)
-app.secret_key = os.getenv("APP_SECRET", "dev-secret")
 
 HEBREW_LETTER_PATTERN = re.compile(r"[\u0590-\u05FF]")
 DIRECTIONAL_MARKS_PATTERN = re.compile(r"[\u200e\u200f]")
@@ -230,60 +221,166 @@ def export_expanded(counter: Counter, path: Path) -> None:
     df.to_excel(path, index=False, sheet_name="expanded")
 
 
-@app.route("/")
-def index():
-    results = session.pop("results", None)
-    return render_template("index.html", results=results)
+class LabelExtractorGUI:
+    def __init__(self, root: tk.Tk) -> None:
+        self.root = root
+        self.root.title("מחלץ תוויות מ-PDF")
+        self.root.geometry("720x520")
+
+        self.selected_file = tk.StringVar()
+        self.status_var = tk.StringVar(value="בחרו קובץ PDF לעיבוד.")
+        self.summary_var = tk.StringVar(value="")
+        self._last_output_path: Optional[Path] = None
+
+        self._build_ui()
+
+    def _build_ui(self) -> None:
+        main_frame = ttk.Frame(self.root, padding=20)
+        main_frame.pack(fill=tk.BOTH, expand=True)
+
+        file_frame = ttk.Frame(main_frame)
+        file_frame.pack(fill=tk.X, pady=(0, 10))
+
+        ttk.Button(file_frame, text="בחר קובץ PDF", command=self.select_file).pack(
+            side=tk.LEFT
+        )
+
+        ttk.Label(file_frame, textvariable=self.selected_file, wraplength=420).pack(
+            side=tk.LEFT, padx=(10, 0), fill=tk.X, expand=True
+        )
+
+        action_frame = ttk.Frame(main_frame)
+        action_frame.pack(fill=tk.X, pady=(0, 10))
+
+        self.process_button = ttk.Button(
+            action_frame, text="עבד קובץ", command=self.process_selected_file
+        )
+        self.process_button.pack(side=tk.LEFT)
+
+        self.open_output_button = ttk.Button(
+            action_frame,
+            text="פתח תיקיית פלט",
+            command=self.open_output_location,
+            state=tk.DISABLED,
+        )
+        self.open_output_button.pack(side=tk.LEFT, padx=(10, 0))
+
+        ttk.Label(main_frame, textvariable=self.status_var).pack(fill=tk.X, pady=(0, 5))
+        ttk.Label(main_frame, textvariable=self.summary_var).pack(fill=tk.X, pady=(0, 10))
+
+        tree_frame = ttk.Frame(main_frame)
+        tree_frame.pack(fill=tk.BOTH, expand=True)
+
+        columns = ("label", "count")
+        self.tree = ttk.Treeview(
+            tree_frame,
+            columns=columns,
+            show="headings",
+            height=12,
+        )
+        self.tree.heading("label", text="תווית")
+        self.tree.heading("count", text="כמות")
+        self.tree.column("label", width=420, anchor=tk.W)
+        self.tree.column("count", width=80, anchor=tk.CENTER)
+        self.tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        scrollbar = ttk.Scrollbar(tree_frame, orient=tk.VERTICAL, command=self.tree.yview)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        self.tree.configure(yscrollcommand=scrollbar.set)
+
+    def select_file(self) -> None:
+        file_path = filedialog.askopenfilename(
+            title="בחרו קובץ PDF",
+            filetypes=[("PDF files", "*.pdf"), ("All files", "*.*")],
+        )
+        if file_path:
+            self.selected_file.set(file_path)
+            self.status_var.set("לחצו 'עבד קובץ' כדי להתחיל.")
+
+    def process_selected_file(self) -> None:
+        file_path = self.selected_file.get()
+        if not file_path:
+            messagebox.showerror("שגיאה", "אנא בחרו קובץ PDF לעיבוד.")
+            return
+
+        try:
+            self.process_button.config(state=tk.DISABLED)
+            self.status_var.set("מעבד את הקובץ, נא להמתין...")
+            self.root.update_idletasks()
+
+            pdf_bytes = Path(file_path).read_bytes()
+            if not pdf_bytes:
+                raise ValueError("קובץ ה-PDF שסופק ריק.")
+
+            text, extraction_mode = extract_pdf_content(pdf_bytes)
+            labels_raw = parse_labels_from_text(text)
+
+            if not labels_raw:
+                raise ValueError("לא נמצאו תוויות בעמודים שנסרקו.")
+
+            combined_counter = build_combined_counter(labels_raw)
+            if not combined_counter:
+                raise ValueError("לא נמצאו תוויות לאחר נרמול וספירה.")
+
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            output_name = f"button_expanded_split_{timestamp}.xlsx"
+            output_path = OUTPUT_DIR / output_name
+            export_expanded(combined_counter, output_path)
+            self._last_output_path = output_path
+
+            self.populate_results(combined_counter)
+            self.summary_var.set(
+                " | ".join(
+                    [
+                        f"מצב חילוץ: {extraction_mode}",
+                        f"סה\"כ תוויות מקוריות: {len(labels_raw)}",
+                        f"סה\"כ שורות בקובץ: {sum(combined_counter.values())}",
+                        f"קובץ פלט: {output_name}",
+                    ]
+                )
+            )
+
+            self.status_var.set("העיבוד הסתיים בהצלחה!")
+            self.open_output_button.config(state=tk.NORMAL)
+            messagebox.showinfo(
+                "הצלחה",
+                "העיבוד הסתיים בהצלחה! הקובץ נשמר בתיקיית outputs.",
+            )
+        except Exception as exc:  # pylint: disable=broad-except
+            self.status_var.set("אירעה שגיאה במהלך העיבוד.")
+            messagebox.showerror("שגיאה", str(exc))
+        finally:
+            self.process_button.config(state=tk.NORMAL)
+
+    def populate_results(self, counter: Counter) -> None:
+        for item in self.tree.get_children():
+            self.tree.delete(item)
+
+        for label, count in sorted(counter.items(), key=lambda item: item[0]):
+            self.tree.insert("", tk.END, values=(label, count))
+
+    def open_output_location(self) -> None:
+        if not self._last_output_path:
+            return
+
+        target = self._last_output_path
+        directory = target.parent
+        try:
+            if sys.platform.startswith("win"):
+                os.startfile(directory)  # type: ignore[attr-defined]
+            elif sys.platform == "darwin":
+                subprocess.run(["open", str(directory)], check=False)
+            else:
+                subprocess.run(["xdg-open", str(directory)], check=False)
+        except Exception as exc:  # pylint: disable=broad-except
+            messagebox.showerror("שגיאה", f"לא ניתן לפתוח את התיקייה: {exc}")
 
 
-@app.route("/process", methods=["POST"])
-def process():
-    pdf_file = request.files.get("pdf_file")
-    if not pdf_file or not pdf_file.filename:
-        flash("נא להעלות קובץ PDF אחד לעיבוד.", "error")
-        return redirect(url_for("index"))
-
-    try:
-        pdf_bytes = pdf_file.read()
-        if not pdf_bytes:
-            raise ValueError("קובץ ה-PDF שסופק ריק.")
-
-        text, extraction_mode = extract_pdf_content(pdf_bytes)
-        labels_raw = parse_labels_from_text(text)
-
-        if not labels_raw:
-            raise ValueError("לא נמצאו תוויות בעמודים שנסרקו.")
-
-        combined_counter = build_combined_counter(labels_raw)
-        if not combined_counter:
-            raise ValueError("לא נמצאו תוויות לאחר נרמול וספירה.")
-
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        output_name = f"button_expanded_split_{timestamp}.xlsx"
-        output_path = OUTPUT_DIR / output_name
-        export_expanded(combined_counter, output_path)
-
-        session["results"] = {
-            "file": {"label": "הורד את קובץ האקסל", "name": output_name},
-            "total_labels": len(labels_raw),
-            "total_rows": sum(combined_counter.values()),
-            "extraction_mode": extraction_mode,
-        }
-        flash("העיבוד הסתיים בהצלחה!", "success")
-    except Exception as exc:  # pylint: disable=broad-except
-        flash(str(exc), "error")
-
-    return redirect(url_for("index"))
-
-
-@app.route("/download/<path:filename>")
-def download_file(filename: str):
-    target = OUTPUT_DIR / filename
-    if not target.exists():
-        flash("הקובץ המבוקש לא נמצא.", "error")
-        return redirect(url_for("index"))
-    return send_from_directory(OUTPUT_DIR, filename, as_attachment=True)
+def main() -> None:
+    root = tk.Tk()
+    LabelExtractorGUI(root)
+    root.mainloop()
 
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000, debug=False)
+    main()
